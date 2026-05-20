@@ -1,15 +1,6 @@
 """
 app.py
 Dashboard utama WiFi Analyzer menggunakan Streamlit.
-Jalankan dengan: streamlit run app.py
-
-Menampilkan:
-- Tabel jaringan WiFi terdeteksi
-- Bar chart RSSI per jaringan
-- Channel map (distribusi penggunaan channel)
-- Indikator kualitas sinyal
-- Rekomendasi channel otomatis
-- Histori scan dari Firebase Firestore
 """
 
 import time
@@ -17,12 +8,11 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
 import streamlit as st
 
 from scanner import scan_wifi
 from analyzer import full_analysis
-from firebase_config import get_scan_history, upload_scan_result
+from firebase_config import init_firebase, upload_scan, get_history
 
 
 # ─────────────────────────────────────────
@@ -35,14 +25,12 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# CSS tambahan untuk styling
 st.markdown("""
 <style>
     .quality-excellent { color: #00C851; font-weight: bold; }
     .quality-good      { color: #33B5E5; font-weight: bold; }
     .quality-fair      { color: #FFBB33; font-weight: bold; }
     .quality-poor      { color: #FF4444; font-weight: bold; }
-    .metric-card       { background: #1E1E2E; border-radius: 10px; padding: 16px; }
     .recommend-box     { background: #0D3B26; border-left: 4px solid #00C851;
                          padding: 12px; border-radius: 6px; margin: 8px 0; }
     .warn-box          { background: #3B1A0D; border-left: 4px solid #FF4444;
@@ -50,10 +38,6 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-
-# ─────────────────────────────────────────
-# Helper: warna kualitas
-# ─────────────────────────────────────────
 QUALITY_COLOR = {
     "Excellent": "#00C851",
     "Good"     : "#33B5E5",
@@ -61,9 +45,15 @@ QUALITY_COLOR = {
     "Poor"     : "#FF4444",
 }
 
-def quality_badge(quality: str) -> str:
-    color = QUALITY_COLOR.get(quality, "#999")
-    return f'<span style="color:{color}; font-weight:bold;">● {quality}</span>'
+
+# ─────────────────────────────────────────
+# Init Firebase sekali saja
+# ─────────────────────────────────────────
+@st.cache_resource
+def get_db():
+    return init_firebase()
+
+db = get_db()
 
 
 # ─────────────────────────────────────────
@@ -99,7 +89,7 @@ with st.sidebar:
 
 
 # ─────────────────────────────────────────
-# Session state untuk menyimpan data scan
+# Session state
 # ─────────────────────────────────────────
 if "networks" not in st.session_state:
     st.session_state.networks = []
@@ -116,26 +106,27 @@ def do_scan():
     with st.spinner("Memindai jaringan WiFi..."):
         networks = scan_wifi()
         if networks:
-            st.session_state.networks      = networks
+            st.session_state.networks       = networks
             st.session_state.last_scan_time = time.strftime("%H:%M:%S")
-            st.session_state.analysis      = full_analysis(networks)
+            st.session_state.analysis       = full_analysis(networks)
 
-            # Upload ke Firebase
-            upload_scan_result(networks)
+            scan_data = {
+                "networks"       : networks,
+                "timestamp"      : time.strftime("%Y-%m-%dT%H:%M:%S"),
+                "total_networks" : len(networks),
+            }
+            upload_scan(db, scan_data)
             st.success(f"✅ Ditemukan {len(networks)} jaringan. Data tersimpan ke Firebase Firestore.")
         else:
             st.warning("Tidak ada jaringan yang terdeteksi.")
 
 
-# Trigger scan
 if scan_btn:
     do_scan()
 
-# Auto scan pertama kali jika belum ada data
 if not st.session_state.networks:
     do_scan()
 
-# Auto refresh
 if auto_refresh:
     time.sleep(refresh_interval)
     do_scan()
@@ -143,12 +134,11 @@ if auto_refresh:
 
 
 # ─────────────────────────────────────────
-# Ambil data & terapkan filter
+# Data & filter
 # ─────────────────────────────────────────
 networks = st.session_state.networks
 analysis = st.session_state.analysis
 
-# Terapkan filter
 filtered = [
     n for n in networks
     if n.get("band") in band_filter
@@ -175,7 +165,7 @@ st.divider()
 
 
 # ─────────────────────────────────────────
-# REKOMENDASI CHANNEL (paling atas)
+# REKOMENDASI CHANNEL
 # ─────────────────────────────────────────
 st.subheader("🎯 Rekomendasi Channel Optimal")
 
@@ -204,7 +194,6 @@ with col_rec5:
         </div>
         """, unsafe_allow_html=True)
 
-# Peringatan channel padat
 congested = analysis.get("congested_channels", [])
 overlaps  = analysis.get("overlapping_pairs", [])
 
@@ -227,7 +216,7 @@ st.divider()
 
 
 # ─────────────────────────────────────────
-# TABEL JARINGAN WiFi TERDETEKSI
+# TABEL JARINGAN
 # ─────────────────────────────────────────
 st.subheader("📋 Jaringan WiFi Terdeteksi")
 
@@ -236,7 +225,6 @@ if filtered:
     df = df[["ssid", "bssid", "rssi", "channel", "band", "quality", "timestamp"]]
     df.columns = ["SSID", "BSSID", "RSSI (dBm)", "Channel", "Band", "Quality", "Timestamp"]
 
-    # Warna berdasarkan kualitas
     def color_quality(val):
         colors = {
             "Excellent": "color: #00C851; font-weight: bold",
@@ -246,7 +234,7 @@ if filtered:
         }
         return colors.get(val, "")
 
-    styled_df = df.style.applymap(color_quality, subset=["Quality"])
+    styled_df = df.style.map(color_quality, subset=["Quality"])
     st.dataframe(styled_df, use_container_width=True, hide_index=True)
 else:
     st.info("Tidak ada jaringan yang cocok dengan filter.")
@@ -255,25 +243,22 @@ st.divider()
 
 
 # ─────────────────────────────────────────
-# GRAFIK: Bar Chart RSSI
+# BAR CHART RSSI
 # ─────────────────────────────────────────
 st.subheader("📊 Kekuatan Sinyal (RSSI) per Jaringan")
 
 if filtered:
     df_plot = pd.DataFrame(filtered).sort_values("rssi", ascending=True)
-
     color_map = {
         "Excellent": "#00C851",
         "Good"     : "#33B5E5",
         "Fair"     : "#FFBB33",
         "Poor"     : "#FF4444",
     }
-    df_plot["color"] = df_plot["quality"].map(color_map)
 
     fig_rssi = px.bar(
         df_plot,
-        x="rssi",
-        y="ssid",
+        x="rssi", y="ssid",
         orientation="h",
         color="quality",
         color_discrete_map=color_map,
@@ -282,12 +267,9 @@ if filtered:
         text="rssi",
     )
     fig_rssi.update_layout(
-        plot_bgcolor="#0E1117",
-        paper_bgcolor="#0E1117",
-        font_color="#FAFAFA",
+        plot_bgcolor="#0E1117", paper_bgcolor="#0E1117", font_color="#FAFAFA",
         xaxis=dict(range=[-100, -20], gridcolor="#333"),
         yaxis=dict(gridcolor="#333"),
-        legend_title="Kualitas Sinyal",
         height=max(300, len(filtered) * 40),
     )
     fig_rssi.update_traces(texttemplate="%{text} dBm", textposition="outside")
@@ -297,46 +279,33 @@ st.divider()
 
 
 # ─────────────────────────────────────────
-# GRAFIK: Channel Map
+# CHANNEL MAP
 # ─────────────────────────────────────────
 st.subheader("📻 Channel Map — Distribusi Penggunaan Channel")
-
 col_ch24, col_ch5 = st.columns(2)
 
 with col_ch24:
     st.markdown("**Band 2.4 GHz**")
     nets_24 = [n for n in filtered if "2.4" in n.get("band", "")]
-
     if nets_24:
-        # Hitung jumlah jaringan per channel
-        ch_counts_24 = {}
-        for ch in range(1, 14):
-            ch_counts_24[ch] = sum(1 for n in nets_24 if n["channel"] == ch)
-
+        ch_counts_24 = {ch: sum(1 for n in nets_24 if n["channel"] == ch) for ch in range(1, 14)}
         fig_ch24, ax = plt.subplots(figsize=(8, 3))
         fig_ch24.patch.set_facecolor("#0E1117")
         ax.set_facecolor("#0E1117")
-
         channels = list(ch_counts_24.keys())
         counts   = list(ch_counts_24.values())
-
-        # Warna bar: merah jika padat, hijau jika kosong
         bar_colors = ["#FF4444" if c >= 3 else "#33B5E5" if c >= 1 else "#2A2A3A" for c in counts]
-        bars = ax.bar(channels, counts, color=bar_colors, edgecolor="#444", width=0.7)
-
-        # Garis channel rekomendasi
+        ax.bar(channels, counts, color=bar_colors, edgecolor="#444", width=0.7)
         rec_ch = rec.get("2.4GHz", {}).get("channel")
         if rec_ch:
             ax.axvline(x=rec_ch, color="#00C851", linestyle="--", linewidth=2, label=f"Rekomendasi: Ch {rec_ch}")
             ax.legend(facecolor="#1E1E2E", labelcolor="white")
-
         ax.set_xlabel("Channel", color="white")
         ax.set_ylabel("Jumlah Jaringan", color="white")
         ax.set_xticks(channels)
         ax.tick_params(colors="white")
         for spine in ax.spines.values():
             spine.set_edgecolor("#333")
-
         st.pyplot(fig_ch24)
     else:
         st.info("Tidak ada jaringan 2.4 GHz setelah filter.")
@@ -344,34 +313,27 @@ with col_ch24:
 with col_ch5:
     st.markdown("**Band 5 GHz**")
     nets_5 = [n for n in filtered if "5" in n.get("band", "")]
-
     if nets_5:
         ch_counts_5 = {}
         for n in nets_5:
             ch = n["channel"]
             ch_counts_5[ch] = ch_counts_5.get(ch, 0) + 1
-
         fig_ch5, ax5 = plt.subplots(figsize=(8, 3))
         fig_ch5.patch.set_facecolor("#0E1117")
         ax5.set_facecolor("#0E1117")
-
         channels5 = sorted(ch_counts_5.keys())
         counts5   = [ch_counts_5[ch] for ch in channels5]
         bar_colors5 = ["#FF4444" if c >= 2 else "#33B5E5" for c in counts5]
-
         ax5.bar(channels5, counts5, color=bar_colors5, edgecolor="#444", width=3)
-
         rec_ch5 = rec.get("5GHz", {}).get("channel")
         if rec_ch5:
             ax5.axvline(x=rec_ch5, color="#00C851", linestyle="--", linewidth=2, label=f"Rekomendasi: Ch {rec_ch5}")
             ax5.legend(facecolor="#1E1E2E", labelcolor="white")
-
         ax5.set_xlabel("Channel", color="white")
         ax5.set_ylabel("Jumlah Jaringan", color="white")
         ax5.tick_params(colors="white")
         for spine in ax5.spines.values():
             spine.set_edgecolor("#333")
-
         st.pyplot(fig_ch5)
     else:
         st.info("Tidak ada jaringan 5 GHz setelah filter.")
@@ -380,7 +342,7 @@ st.divider()
 
 
 # ─────────────────────────────────────────
-# GRAFIK: Interference Score
+# INTERFERENCE SCORE
 # ─────────────────────────────────────────
 st.subheader("⚡ Skor Interferensi per Channel")
 
@@ -391,21 +353,15 @@ if interference:
         columns=["Channel", "Skor Interferensi"]
     )
     df_int["Channel"] = df_int["Channel"].astype(str)
-
     fig_int = px.bar(
-        df_int,
-        x="Channel",
-        y="Skor Interferensi",
+        df_int, x="Channel", y="Skor Interferensi",
         color="Skor Interferensi",
         color_continuous_scale=["#00C851", "#FFBB33", "#FF4444"],
         title="Skor Interferensi (lebih rendah = lebih baik)",
-        labels={"Skor Interferensi": "Skor"},
     )
     fig_int.update_layout(
-        plot_bgcolor="#0E1117",
-        paper_bgcolor="#0E1117",
-        font_color="#FAFAFA",
-        yaxis=dict(gridcolor="#333"),
+        plot_bgcolor="#0E1117", paper_bgcolor="#0E1117",
+        font_color="#FAFAFA", yaxis=dict(gridcolor="#333"),
         coloraxis_showscale=False,
     )
     st.plotly_chart(fig_int, use_container_width=True)
@@ -414,13 +370,12 @@ st.divider()
 
 
 # ─────────────────────────────────────────
-# HISTORI DATA CLOUD (Firebase)
+# HISTORI CLOUD
 # ─────────────────────────────────────────
 if show_history:
     st.subheader("☁️ Histori Scan dari Firebase Firestore")
-
     with st.spinner("Mengambil data dari Firestore..."):
-        history = get_scan_history(limit=10)
+        history = get_history(db, limit=10)
 
     if history:
         for i, scan in enumerate(history):
@@ -431,7 +386,7 @@ if show_history:
                     df_hist.columns = ["SSID", "RSSI (dBm)", "Channel", "Band", "Quality"]
                     st.dataframe(df_hist, use_container_width=True, hide_index=True)
     else:
-        st.info("Belum ada histori scan di Firestore. Lakukan scan dan simpan terlebih dahulu.")
+        st.info("Belum ada histori scan. Lakukan scan terlebih dahulu.")
 
 st.divider()
 
